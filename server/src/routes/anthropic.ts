@@ -16,7 +16,7 @@ import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { logRequest } from '../lib/request-log.js';
-import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
+import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel, clearStickyModel, STICKY_SLOW_THRESHOLD_MS } from './proxy.js';
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
@@ -442,7 +442,10 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
         } catch (err: any) {
           // The stream already committed (message_start sent) and surfaced its
           // own error event; stop without failover or a second response.
-          if (err instanceof StreamAlreadyStarted) return 'committed';
+          if (err instanceof StreamAlreadyStarted) {
+            clearStickyModel(messages, sessionId);
+            return 'committed';
+          }
           throw err;
         }
       }
@@ -499,7 +502,13 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       recordUpstreamSuccess(route, result.usage?.total_tokens ?? promptTokens + completionTokens);
       // Remember this model for the rest of the auto-routed session (no-op for
       // a pinned request — the pin already fixes the model).
-      if (!resolved.pinned) setStickyModel(messages, route.modelDbId, sessionId);
+      if (!resolved.pinned) {
+        if (Date.now() - start > STICKY_SLOW_THRESHOLD_MS) {
+          clearStickyModel(messages, sessionId);
+        } else {
+          setStickyModel(messages, route.modelDbId, sessionId);
+        }
+      }
 
       const anthropicResponse: AnthropicMessageResponse = {
         id: newMessageId(),
@@ -522,10 +531,12 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, sanitizeProviderErrorMessage(err.message), null, pinnedModelId);
     },
     onFatal: (route, err, attempt) => {
+      clearStickyModel(messages, sessionId);
       setFallbackHeaders(res, attempt, attemptLog);
       sendError(res, 502, 'api_error', `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(err.message)}`);
     },
     onRoutingExhausted: (lastError, routeErr, exhaustion, info) => {
+      clearStickyModel(messages, sessionId);
       if (exhaustion) {
         setFallbackHeaders(res, info.attempts.length, info.attempts);
         sendError(res, exhaustion.status, anthropicErrorType(exhaustion), exhaustion.message);
@@ -534,6 +545,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       }
     },
     onExhausted: (exhaustion, info) => {
+      clearStickyModel(messages, sessionId);
       setFallbackHeaders(res, info.attempts.length, info.attempts);
       sendError(res, exhaustion.status, anthropicErrorType(exhaustion), exhaustion.message);
     },
@@ -767,7 +779,13 @@ async function streamCompletion(
     res.end();
 
     recordUpstreamSuccess(route, ctx.estimatedInputTokens + outputTokens);
-    if (!ctx.pinned) setStickyModel(messages, route.modelDbId, ctx.sessionId);
+    if (!ctx.pinned) {
+      if (Date.now() - ctx.start > STICKY_SLOW_THRESHOLD_MS) {
+        clearStickyModel(messages, ctx.sessionId);
+      } else {
+        setStickyModel(messages, route.modelDbId, ctx.sessionId);
+      }
+    }
     logRequest(route.platform, route.modelId, route.keyId, 'success', ctx.estimatedInputTokens, outputTokens, Date.now() - ctx.start, null, null, ctx.pinnedModelId);
   } catch (err: any) {
     if (err instanceof StreamAlreadyStarted) throw err;

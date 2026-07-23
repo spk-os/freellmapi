@@ -137,6 +137,10 @@ export { exhaustedRetryError };
 // This prevents model switching mid-conversation which causes hallucination
 const stickySessionMap = new Map<string, { modelDbId: number; lastUsed: number }>();
 const STICKY_TTL_MS = 30 * 60 * 1000; // 30 min session TTL
+// If a request (including retries) takes longer than this, invalidate the
+// sticky session so the next request picks a fresh model instead of sticking
+// to a slow one.
+export const STICKY_SLOW_THRESHOLD_MS = 200 * 1000;
 
 function getSessionKey(messages: ChatMessage[], sessionIdHeader?: string, strategyKey?: string): string {
   if (sessionIdHeader) {
@@ -193,7 +197,13 @@ export function setStickyModel(messages: ChatMessage[], modelDbId: number, sessi
   }
 }
 
-// OpenAI-compatible /models endpoint (used by Hermes for metadata) 
+export function clearStickyModel(messages: ChatMessage[], sessionIdHeader?: string, strategyKey?: string) {
+  const key = getSessionKey(messages, sessionIdHeader, strategyKey);
+  if (!key) return;
+  stickySessionMap.delete(key);
+}
+
+// OpenAI-compatible /models endpoint (used by Hermes for metadata)
 // shows API models which is linked by the user
 proxyRouter.get('/models', (req: Request, res: Response) => {
   const token = extractApiToken(req);
@@ -1715,7 +1725,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.end();
 
           recordUpstreamSuccess(route, estimatedInputTokens + injectedHandoffTokens + totalOutputTokens);
-          setStickyModel(messages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
+          if (Date.now() - start > STICKY_SLOW_THRESHOLD_MS) {
+            clearStickyModel(messages, sessionIdHeader, stickyStrategyKey);
+          } else {
+            setStickyModel(messages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
+          }
           if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
           traceRouteEvent('Proxy', {
             event: 'ok',
@@ -1734,6 +1748,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // Mid-stream error after real payload reached the client — finish
             // the SSE response honestly instead of leaving the client hanging.
             console.error(`[Proxy] Mid-stream error from ${route.displayName}:`, streamErr.message);
+            clearStickyModel(messages, sessionIdHeader, stickyStrategyKey);
             const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
@@ -1853,7 +1868,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // from (set to the requested model id at the top of the loop). Matches the
         // streaming success path; without it, "prefer last successful provider"
         // is lost for non-streaming group-pinned sessions. (#341 review)
-        setStickyModel(messages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
+        if (Date.now() - start > STICKY_SLOW_THRESHOLD_MS) {
+          clearStickyModel(messages, sessionIdHeader, stickyStrategyKey);
+        } else {
+          setStickyModel(messages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
+        }
         if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
@@ -1920,6 +1939,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     },
     onFatal: (route, err, attempt) => {
       // Non-retryable error (bare 4xx, etc.): don't retry.
+      clearStickyModel(messages, sessionIdHeader, stickyStrategyKey);
       setFallbackHeaders(res, attempt, attemptLog);
       res.status(502).json({
         error: {
@@ -1930,6 +1950,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     },
     onRoutingExhausted: (lastError, routeErr, exhaustion, info) => {
       // No more models available.
+      clearStickyModel(messages, sessionIdHeader, stickyStrategyKey);
       if (exhaustion) {
         setFallbackHeaders(res, info.attempts.length, info.attempts);
         res.status(exhaustion.status).json({ error: { message: exhaustion.message, type: exhaustion.type } });
@@ -1948,6 +1969,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
     },
     onExhausted: (exhaustion, info) => {
+      clearStickyModel(messages, sessionIdHeader, stickyStrategyKey);
       setFallbackHeaders(res, info.attempts.length, info.attempts);
       res.status(exhaustion.status).json({ error: { message: exhaustion.message, type: exhaustion.type } });
     },

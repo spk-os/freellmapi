@@ -20,6 +20,8 @@ import {
   getRequestGroupId,
   getStickyModel,
   setStickyModel,
+  clearStickyModel,
+  STICKY_SLOW_THRESHOLD_MS,
   traceRouteEvent,
   logRequest,
 } from './proxy.js';
@@ -665,7 +667,11 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           res.end();
 
           recordUpstreamSuccess(route, estimatedInputTokens + totalOutputTokens);
-          setStickyModel(messages, route.modelDbId, sessionIdHeader);
+          if (Date.now() - start > STICKY_SLOW_THRESHOLD_MS) {
+            clearStickyModel(messages, sessionIdHeader);
+          } else {
+            setStickyModel(messages, route.modelDbId, sessionIdHeader);
+          }
           traceRouteEvent('Responses', {
             event: 'ok',
             requestId: requestGroupId,
@@ -683,6 +689,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           // response.failed event honestly and stop. A pre-commit failure throws
           // through to the shared loop for cooldown + failover.
           if (streamStarted) {
+            clearStickyModel(messages, sessionIdHeader);
             const safe = sanitizeProviderErrorMessage(streamErr.message);
             traceRouteEvent('Responses', {
               event: 'fail',
@@ -768,7 +775,11 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       // tokens against the rate-limit ledger; promptTokens/completionTokens
       // above already carry the chars/4 estimate.
       recordUpstreamSuccess(route, result.usage?.total_tokens ?? (promptTokens + completionTokens));
-      setStickyModel(messages, route.modelDbId, sessionIdHeader);
+      if (Date.now() - start > STICKY_SLOW_THRESHOLD_MS) {
+        clearStickyModel(messages, sessionIdHeader);
+      } else {
+        setStickyModel(messages, route.modelDbId, sessionIdHeader);
+      }
 
       res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
       setFallbackHeaders(res, attempt, attemptLog);
@@ -805,10 +816,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
     },
     onFatal: (route, err, attempt) => {
+      clearStickyModel(messages, sessionIdHeader);
       setFallbackHeaders(res, attempt, attemptLog);
       res.status(502).json({ error: { message: `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(err.message)}`, type: 'provider_error' } });
     },
     onRoutingExhausted: (lastError, routeErr, exhaustion, info) => {
+      clearStickyModel(messages, sessionIdHeader);
       const status = exhaustion?.status ?? routeErr.status ?? 503;
       const message = exhaustion?.message ?? routeErr.message;
       const type = exhaustion?.type ?? 'routing_error';
@@ -821,6 +834,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
     },
     onExhausted: (exhaustion, info) => {
+      clearStickyModel(messages, sessionIdHeader);
       // The streaming skeleton may already be on the wire — close the SSE stream
       // with a failed event instead of writing JSON onto a committed response.
       if (streamStarted) {
